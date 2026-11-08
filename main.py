@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import asyncio
 
-import html
-
 import json
 
 import logging
@@ -94,10 +92,6 @@ FORCE_SUB_ENABLED_DEFAULT = os.getenv("FORCE_SUB_ENABLED", "false").strip().lowe
 }
 
 LOG_CHAT_ID = int(os.getenv("LOG_CHAT_ID", "0") or 0)
-
-# Alohida ommaviy kanal: faqat muvaffaqiyatli yetkazilgan buyurtmalar.
-# Railway Variables: ORDER_LOG_CHANNEL=@starOson
-ORDER_LOG_CHANNEL = os.getenv("ORDER_LOG_CHANNEL", "").strip()
 
 
 
@@ -225,11 +219,6 @@ class Flow(StatesGroup):
 def money(v: int) -> str:
 
     return f"{v:,}".replace(",", " ")
-
-
-def esc(value) -> str:
-    """Telegram HTML parse_mode uchun tashqi matnni xavfsiz qiladi."""
-    return html.escape(str(value or ""), quote=False)
 
 
 
@@ -402,6 +391,7 @@ def admin_panel_kb(enabled: bool = True) -> InlineKeyboardMarkup:
             [b("💰 Narxlarni o‘zgartirish", "admin:prices", "primary")],
             [b("📢 Kanal sozlamalari", "admin:channel", "primary"), b("👑 VIP tizimi", "admin:vip", "primary")],
             [b("💳 Avto-to'lov holati", "admin:autopay", "primary")],
+            [b("📢 Log kanalni tekshirish", "admin:logtest", "primary")],
             [b(*toggle)],
             [b("🏠 Bosh menyu", "menu:main", "primary")],
         ]
@@ -582,25 +572,6 @@ async def db_init() -> None:
             "CREATE INDEX IF NOT EXISTS idx_orders_pay_amount ON orders(pay_amount)"
 
         )
-
-        # Alohida kanalga yuboriladigan xabarlar uchun doimiy navbat.
-        # Eski orders jadvali va to'lov mexanizmi o'zgarmaydi.
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS order_channel_posts (
-                order_ref TEXT PRIMARY KEY,
-                state TEXT NOT NULL DEFAULT 'pending',
-                attempted_at TEXT,
-                sent_at TEXT,
-                channel_message_id INTEGER
-            )
-        """)
-        # Restart o'rtasida uzilgan yuborishlarni qayta urinish uchun.
-        # Diqqat: Telegram qabul qilib, DB qayd etilmasdan server uzilsa,
-        # juda kam holatda kanal xabari takrorlanishi mumkin.
-        await db.execute("""
-            UPDATE order_channel_posts SET state='pending'
-            WHERE state='sending'
-        """)
 
         await db.commit()
 
@@ -975,16 +946,9 @@ async def set_status(ref: str, expected: tuple[str, ...], new: str, **extra) -> 
 
         )
 
-        changed = cur.rowcount == 1
-        if changed and new == "completed":
-            # Buyurtma yakunlangani va kanal navbatini bitta tranzaksiyada saqlaymiz.
-            await db.execute(
-                "INSERT OR IGNORE INTO order_channel_posts(order_ref,state) VALUES(?,'pending')",
-                (ref,),
-            )
         await db.commit()
 
-        return changed
+        return cur.rowcount == 1
 
 
 
@@ -1006,103 +970,6 @@ async def log_event(bot: Bot, text: str) -> None:
 
 
 
-
-
-
-
-# ========================= BUYURTMALAR KANALI =========================
-
-async def publish_order_to_channel(bot: Bot, ref: str) -> None:
-    """Faqat completed buyurtmani kanalga yuboradi; xatoda qayta urinadi.
-
-    Savdo va to'lov oqimiga ta'sir qilmaslik uchun xatolar ichkarida ushlanadi.
-    """
-    if not ORDER_LOG_CHANNEL:
-        return
-
-    # Bitta orderni parallel vazifalar ikki marta yuborib yubormasligi uchun
-    # navbat elementini bazada atomik band qilamiz.
-    async with db_connect() as db:
-        cur = await db.execute(
-            """UPDATE order_channel_posts SET state='sending', attempted_at=?
-               WHERE order_ref=? AND state='pending'
-                 AND EXISTS (
-                   SELECT 1 FROM orders
-                   WHERE orders.order_ref=order_channel_posts.order_ref
-                     AND orders.status='completed'
-                 )""",
-            (datetime.utcnow().isoformat(), ref),
-        )
-        await db.commit()
-        if cur.rowcount != 1:
-            return
-
-    try:
-        order = await get_order(ref)
-        if not order or order["status"] != "completed":
-            raise RuntimeError("Buyurtma yakunlangan holatda emas")
-
-        quantity = order["stars_amount"] if order["kind"] == "stars" else order["months"]
-        product = (
-            f"⭐ {quantity} Telegram Stars"
-            if order["kind"] == "stars"
-            else f"💎 Telegram Premium — {quantity} oy"
-        )
-        from datetime import timedelta as _timedelta
-        completed_raw = order["completed_at"] or datetime.utcnow().isoformat()
-        completed_dt = datetime.fromisoformat(completed_raw)
-        if completed_dt.tzinfo is None:
-            completed_dt = completed_dt.replace(tzinfo=timezone.utc)
-        local_dt = completed_dt.astimezone(timezone(_timedelta(hours=5)))
-
-        # Ommaviy kanalda xaridorning ID, username, karta raqami yoki
-        # to'lov chekini e'lon qilmaymiz.
-        msg = (
-            "✅ <b>StarsOson | Buyurtma bajarildi</b>\n\n"
-            f"🧾 Buyurtma: <code>{esc(ref)}</code>\n"
-            f"📦 Mahsulot: <b>{esc(product)}</b>\n"
-            "📍 Holat: <b>Muvaffaqiyatli yetkazildi</b>\n"
-            f"🕓 Sana: {local_dt:%d.%m.%Y %H:%M} (UZT)"
-        )
-        posted = await bot.send_message(ORDER_LOG_CHANNEL, msg)
-    except Exception:
-        log.exception("Buyurtma kanaliga yuborilmadi: %s", ref)
-        # Keyingi tekshiruvda qayta urinadi. Buyurtma qayta sotib olinmaydi.
-        async with db_connect() as db:
-            await db.execute(
-                "UPDATE order_channel_posts SET state='pending' WHERE order_ref=? AND state='sending'",
-                (ref,),
-            )
-            await db.commit()
-        return
-
-    async with db_connect() as db:
-        await db.execute(
-            """UPDATE order_channel_posts
-               SET state='sent', sent_at=?, channel_message_id=?
-               WHERE order_ref=? AND state='sending'""",
-            (datetime.utcnow().isoformat(), posted.message_id, ref),
-        )
-        await db.commit()
-
-
-async def order_channel_worker(bot: Bot) -> None:
-    """Telegram xatosi bo'lganda kanal xabarlarini keyinroq qayta yuboradi."""
-    while True:
-        try:
-            if ORDER_LOG_CHANNEL:
-                async with db_connect() as db:
-                    cur = await db.execute(
-                        "SELECT order_ref FROM order_channel_posts WHERE state='pending' ORDER BY rowid LIMIT 20"
-                    )
-                    refs = [row[0] for row in await cur.fetchall()]
-                for ref in refs:
-                    await publish_order_to_channel(bot, ref)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            log.exception("Buyurtmalar kanalining navbatini tekshirishda xato")
-        await asyncio.sleep(60)
 
 
 async def admins(bot: Bot, text: str, markup=None) -> None:
@@ -1214,7 +1081,7 @@ async def home_text(u) -> str:
         vip_line += f" — <b>{vip_discount}% chegirma</b>"
 
     return (
-        f"👋 <b>Assalomu alaykum, {esc(u.first_name or 'Foydalanuvchi')}!</b>\n\n"
+        f"👋 <b>Assalomu alaykum, {u.first_name or 'Foydalanuvchi'}!</b>\n\n"
         f"StarsOson botga xush kelibsiz!\n\n"
         f"🆔 StarsOson ID: <b>{uid}</b>\n"
         f"💰 Xaridlar: <b>{money(total)} so'm</b>\n"
@@ -1231,31 +1098,33 @@ async def home_text(u) -> str:
 
 
 async def ensure_enabled(c: CallbackQuery) -> bool:
+    """Bot yoqilgan bo'lsa barcha mijozlarga ruxsat beradi; admin har doim kira oladi."""
     if c.from_user.id in ADMIN_IDS:
         return True
 
     if await setting("bot_enabled", "1") != "1":
-        await c.answer("⛔ Bot vaqtincha texnik xizmatda.", show_alert=True)
+        await c.answer("⛔ Bot vaqtincha texnik xizmatda. Keyinroq urinib ko‘ring.", show_alert=True)
         return False
 
     return True
 
 
 @router.callback_query(F.data == "sub:check")
-async def subscription_check(c: CallbackQuery, bot: Bot, state: FSMContext):
-    if not await ensure_enabled(c):
-        return
-
+async def subscription_check(c: CallbackQuery, bot: Bot):
     if await is_channel_member(bot, c.from_user.id):
-        # Oldingi Stars/Premium FSM holati tasodifan davom etib ketmasin.
-        await state.clear()
         await c.message.edit_text(
             await home_text(c.from_user),
             reply_markup=main_kb(c.from_user.id in ADMIN_IDS),
         )
         return await c.answer("✅ Obuna tasdiqlandi.")
-
     await c.answer("❌ Hali kanalga obuna bo‘lmagansiz.", show_alert=True)
+    if await setting("bot_enabled", "1") != "1":
+
+        await c.answer("⛔ Bot vaqtincha texnik xizmatda.", show_alert=True)
+
+        return False
+
+    return True
 
 
 
@@ -1293,7 +1162,7 @@ async def deliver(bot: Bot, ref: str) -> None:
 
     if result.get("ok"):
 
-        completed = await set_status(
+        await set_status(
 
             ref,
 
@@ -1308,14 +1177,6 @@ async def deliver(bot: Bot, ref: str) -> None:
             error=None,
 
         )
-        if not completed:
-            log.error("Yetkazildi, lekin completed holati saqlanmadi: %s", ref)
-            await admins(bot, f"🚨 Yetkazildi, DB holatini qo'lda tekshiring: <code>{esc(ref)}</code>")
-            return
-
-        # Kanalga faqat Fragment muvaffaqiyatni tasdiqlagach yuboramiz.
-        # Kanal xatosi mijozga yetkazilgan mahsulot holatini o'zgartirmaydi.
-        await publish_order_to_channel(bot, ref)
 
         paid_amount = o["pay_amount"] or o["amount_uzs"]
 
@@ -1375,9 +1236,9 @@ async def deliver(bot: Bot, ref: str) -> None:
 
         )
 
-        await admins(bot, f"🚨 DELIVERY FAILED <code>{ref}</code>\n{esc(err)}")
+        await admins(bot, f"🚨 DELIVERY FAILED <code>{ref}</code>\n{err}")
 
-        await log_event(bot, f"🚨 Yetkazish xatosi <code>{ref}</code>\n{esc(err)}")
+        await log_event(bot, f"🚨 Yetkazish xatosi <code>{ref}</code>\n{err}")
 
 
 
@@ -1981,9 +1842,6 @@ async def home(c: CallbackQuery, state: FSMContext, bot: Bot):
 
     await state.clear()
 
-    if not await ensure_enabled(c):
-        return
-
     if not await require_subscription_callback(c, bot):
         return
 
@@ -2040,14 +1898,7 @@ async def stars(c: CallbackQuery, state: FSMContext, bot: Bot):
 
 @router.message(Flow.stars)
 
-async def stars_amount(m: Message, state: FSMContext, bot: Bot):
-
-    if await setting("bot_enabled", "1") != "1" and m.from_user.id not in ADMIN_IDS:
-        await state.clear()
-        return await m.answer("⛔ Bot vaqtincha texnik xizmatda.")
-
-    if not await require_subscription_message(m, bot):
-        return
+async def stars_amount(m: Message, state: FSMContext):
 
     try:
 
@@ -2215,12 +2066,7 @@ async def show_confirm(
 
 @router.callback_query(F.data == "recipient:self")
 
-async def self_rec(c: CallbackQuery, state: FSMContext, bot: Bot):
-
-    if not await ensure_enabled(c):
-        return
-    if not await require_subscription_callback(c, bot):
-        return
+async def self_rec(c: CallbackQuery, state: FSMContext):
 
     if not c.from_user.username:
 
@@ -2242,14 +2088,7 @@ async def self_rec(c: CallbackQuery, state: FSMContext, bot: Bot):
 
 @router.message(Flow.username)
 
-async def username(m: Message, state: FSMContext, bot: Bot):
-
-    if await setting("bot_enabled", "1") != "1" and m.from_user.id not in ADMIN_IDS:
-        await state.clear()
-        return await m.answer("⛔ Bot vaqtincha texnik xizmatda.")
-
-    if not await require_subscription_message(m, bot):
-        return
+async def username(m: Message, state: FSMContext):
 
     username_value = (m.text or "").strip().lstrip("@")
 
@@ -2310,11 +2149,6 @@ async def abort(c: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "order:confirm")
 
 async def confirm(c: CallbackQuery, state: FSMContext, bot: Bot):
-
-    if not await ensure_enabled(c):
-        return
-    if not await require_subscription_callback(c, bot):
-        return
 
     data = await state.get_data()
 
@@ -2394,7 +2228,7 @@ async def confirm(c: CallbackQuery, state: FSMContext, bot: Bot):
     new_order_text = (
         f"🆕 <b>Yangi buyurtma</b>\n"
         f"🧾 <code>{ref}</code>\n"
-        f"👤 {esc(c.from_user.full_name)} ({c.from_user.id})\n"
+        f"👤 {c.from_user.full_name} ({c.from_user.id})\n"
         f"📦 {product}\n"
         f"🎯 @{data['target']}\n"
         f"💰 Narx: {money(int(data['amount']))} so'm\n"
@@ -2629,7 +2463,7 @@ async def profile(c: CallbackQuery):
     await c.message.edit_text(
         f"👤 <b>Profil</b>\n\n"
         f"🆔 StarsOson ID: <b>{uid}</b>\n"
-        f"👤 {esc(c.from_user.full_name)}\n"
+        f"👤 {c.from_user.full_name}\n"
         f"🔗 @{c.from_user.username or 'username yo‘q'}\n"
         f"📦 Buyurtmalar: <b>{cnt}</b>\n"
         f"💰 Xaridlar: <b>{money(total)} so'm</b>\n"
@@ -2939,9 +2773,9 @@ async def admin_price_pick(c: CallbackQuery, state: FSMContext):
 async def admin_price_value(m: Message, state: FSMContext):
     if m.from_user.id not in ADMIN_IDS:
         return
-    raw = (m.text or "").strip().replace(" ", "")
-    if not re.fullmatch(r"\d+", raw):
-        return await m.answer("❌ Narxni faqat butun raqamda yuboring. Masalan: <code>210</code>")
+    raw = re.sub(r"\D", "", m.text or "")
+    if not raw:
+        return await m.answer("❌ Narxni faqat raqamda yuboring.")
     value = int(raw)
     if value <= 0:
         return await m.answer("❌ Narx 0 dan katta bo‘lishi kerak.")
@@ -3221,7 +3055,7 @@ async def admin_vip(c: CallbackQuery):
     top_lines = []
     for idx, row in enumerate(rows, 1):
         level, _ = vip_info(int(row[3] or 0))
-        name = esc(row[1] or row[2] or str(row[0]))
+        name = row[1] or row[2] or str(row[0])
         top_lines.append(f"{idx}. {name} — <b>{money(int(row[3] or 0))} so'm</b> — {level}")
 
     await c.message.edit_text(
@@ -3389,7 +3223,7 @@ async def ausers(c: CallbackQuery):
 
         ).fetchall()
 
-    lines = [f"👤 {esc(x[1])} | <code>{x[0]}</code> | @{esc(x[2] or '-')}" for x in rows]
+    lines = [f"👤 {x[1]} | <code>{x[0]}</code> | @{x[2] or '-'}" for x in rows]
 
     await c.message.edit_text(
 
@@ -3427,9 +3261,19 @@ async def logtest(c: CallbackQuery, bot: Bot):
 
         )
 
-    await log_event(bot, "✅ <b>PremiumHub log testi muvaffaqiyatli.</b>")
+    try:
+        await bot.send_message(
+            LOG_CHAT_ID,
+            "✅ <b>StarsOson log testi muvaffaqiyatli.</b>\n"
+            "Log kanalga botdan xabar yuborish ishlayapti.",
+        )
+    except Exception as exc:
+        log.exception("Log kanal test xabari yuborilmadi")
+        return await c.answer(
+            f"Log yuborilmadi: {str(exc)[:140]}", show_alert=True
+        )
 
-    await c.answer("Log kanalga test yuborildi.")
+    await c.answer("✅ Log kanalga test xabari yuborildi.")
 
 
 
@@ -3472,21 +3316,10 @@ async def main() -> None:
 
 
     sweeper_task = asyncio.create_task(order_sweeper(bot))
-    order_channel_task = asyncio.create_task(order_channel_worker(bot))
 
-    # CardXabar userbotida muammo bo‘lsa ham asosiy StarsOson bot yiqilmasin.
-    try:
-        userbot = await start_userbot(bot)
-    except Exception:
-        userbot = None
-        log.exception("CardXabar userbot ishga tushmadi; asosiy bot ishlashda davom etadi")
-        try:
-            await admins(
-                bot,
-                "⚠️ <b>Avto-to‘lov ishga tushmadi.</b>\nAsosiy bot ishlayapti, CardXabar sozlamalarini tekshiring.",
-            )
-        except Exception:
-            pass
+    userbot = await start_userbot(bot)
+
+
 
     try:
 
@@ -3495,7 +3328,6 @@ async def main() -> None:
     finally:
 
         sweeper_task.cancel()
-        order_channel_task.cancel()
 
         try:
 
@@ -3503,11 +3335,6 @@ async def main() -> None:
 
         except asyncio.CancelledError:
 
-            pass
-
-        try:
-            await order_channel_task
-        except asyncio.CancelledError:
             pass
 
         if userbot is not None:
