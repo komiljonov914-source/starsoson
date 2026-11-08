@@ -95,6 +95,10 @@ FORCE_SUB_ENABLED_DEFAULT = os.getenv("FORCE_SUB_ENABLED", "false").strip().lowe
 
 LOG_CHAT_ID = int(os.getenv("LOG_CHAT_ID", "0") or 0)
 
+# Alohida ommaviy kanal: faqat muvaffaqiyatli yetkazilgan buyurtmalar.
+# Railway Variables: ORDER_LOG_CHANNEL=@starOson
+ORDER_LOG_CHANNEL = os.getenv("ORDER_LOG_CHANNEL", "").strip()
+
 
 
 STAR_PRICE_UZS = int(os.getenv("STAR_PRICE_UZS", "200"))
@@ -579,6 +583,25 @@ async def db_init() -> None:
 
         )
 
+        # Alohida kanalga yuboriladigan xabarlar uchun doimiy navbat.
+        # Eski orders jadvali va to'lov mexanizmi o'zgarmaydi.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS order_channel_posts (
+                order_ref TEXT PRIMARY KEY,
+                state TEXT NOT NULL DEFAULT 'pending',
+                attempted_at TEXT,
+                sent_at TEXT,
+                channel_message_id INTEGER
+            )
+        """)
+        # Restart o'rtasida uzilgan yuborishlarni qayta urinish uchun.
+        # Diqqat: Telegram qabul qilib, DB qayd etilmasdan server uzilsa,
+        # juda kam holatda kanal xabari takrorlanishi mumkin.
+        await db.execute("""
+            UPDATE order_channel_posts SET state='pending'
+            WHERE state='sending'
+        """)
+
         await db.commit()
 
 
@@ -952,9 +975,16 @@ async def set_status(ref: str, expected: tuple[str, ...], new: str, **extra) -> 
 
         )
 
+        changed = cur.rowcount == 1
+        if changed and new == "completed":
+            # Buyurtma yakunlangani va kanal navbatini bitta tranzaksiyada saqlaymiz.
+            await db.execute(
+                "INSERT OR IGNORE INTO order_channel_posts(order_ref,state) VALUES(?,'pending')",
+                (ref,),
+            )
         await db.commit()
 
-        return cur.rowcount == 1
+        return changed
 
 
 
@@ -976,6 +1006,103 @@ async def log_event(bot: Bot, text: str) -> None:
 
 
 
+
+
+
+
+# ========================= BUYURTMALAR KANALI =========================
+
+async def publish_order_to_channel(bot: Bot, ref: str) -> None:
+    """Faqat completed buyurtmani kanalga yuboradi; xatoda qayta urinadi.
+
+    Savdo va to'lov oqimiga ta'sir qilmaslik uchun xatolar ichkarida ushlanadi.
+    """
+    if not ORDER_LOG_CHANNEL:
+        return
+
+    # Bitta orderni parallel vazifalar ikki marta yuborib yubormasligi uchun
+    # navbat elementini bazada atomik band qilamiz.
+    async with db_connect() as db:
+        cur = await db.execute(
+            """UPDATE order_channel_posts SET state='sending', attempted_at=?
+               WHERE order_ref=? AND state='pending'
+                 AND EXISTS (
+                   SELECT 1 FROM orders
+                   WHERE orders.order_ref=order_channel_posts.order_ref
+                     AND orders.status='completed'
+                 )""",
+            (datetime.utcnow().isoformat(), ref),
+        )
+        await db.commit()
+        if cur.rowcount != 1:
+            return
+
+    try:
+        order = await get_order(ref)
+        if not order or order["status"] != "completed":
+            raise RuntimeError("Buyurtma yakunlangan holatda emas")
+
+        quantity = order["stars_amount"] if order["kind"] == "stars" else order["months"]
+        product = (
+            f"⭐ {quantity} Telegram Stars"
+            if order["kind"] == "stars"
+            else f"💎 Telegram Premium — {quantity} oy"
+        )
+        from datetime import timedelta as _timedelta
+        completed_raw = order["completed_at"] or datetime.utcnow().isoformat()
+        completed_dt = datetime.fromisoformat(completed_raw)
+        if completed_dt.tzinfo is None:
+            completed_dt = completed_dt.replace(tzinfo=timezone.utc)
+        local_dt = completed_dt.astimezone(timezone(_timedelta(hours=5)))
+
+        # Ommaviy kanalda xaridorning ID, username, karta raqami yoki
+        # to'lov chekini e'lon qilmaymiz.
+        msg = (
+            "✅ <b>StarsOson | Buyurtma bajarildi</b>\n\n"
+            f"🧾 Buyurtma: <code>{esc(ref)}</code>\n"
+            f"📦 Mahsulot: <b>{esc(product)}</b>\n"
+            "📍 Holat: <b>Muvaffaqiyatli yetkazildi</b>\n"
+            f"🕓 Sana: {local_dt:%d.%m.%Y %H:%M} (UZT)"
+        )
+        posted = await bot.send_message(ORDER_LOG_CHANNEL, msg)
+    except Exception:
+        log.exception("Buyurtma kanaliga yuborilmadi: %s", ref)
+        # Keyingi tekshiruvda qayta urinadi. Buyurtma qayta sotib olinmaydi.
+        async with db_connect() as db:
+            await db.execute(
+                "UPDATE order_channel_posts SET state='pending' WHERE order_ref=? AND state='sending'",
+                (ref,),
+            )
+            await db.commit()
+        return
+
+    async with db_connect() as db:
+        await db.execute(
+            """UPDATE order_channel_posts
+               SET state='sent', sent_at=?, channel_message_id=?
+               WHERE order_ref=? AND state='sending'""",
+            (datetime.utcnow().isoformat(), posted.message_id, ref),
+        )
+        await db.commit()
+
+
+async def order_channel_worker(bot: Bot) -> None:
+    """Telegram xatosi bo'lganda kanal xabarlarini keyinroq qayta yuboradi."""
+    while True:
+        try:
+            if ORDER_LOG_CHANNEL:
+                async with db_connect() as db:
+                    cur = await db.execute(
+                        "SELECT order_ref FROM order_channel_posts WHERE state='pending' ORDER BY rowid LIMIT 20"
+                    )
+                    refs = [row[0] for row in await cur.fetchall()]
+                for ref in refs:
+                    await publish_order_to_channel(bot, ref)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Buyurtmalar kanalining navbatini tekshirishda xato")
+        await asyncio.sleep(60)
 
 
 async def admins(bot: Bot, text: str, markup=None) -> None:
@@ -1166,7 +1293,7 @@ async def deliver(bot: Bot, ref: str) -> None:
 
     if result.get("ok"):
 
-        await set_status(
+        completed = await set_status(
 
             ref,
 
@@ -1181,6 +1308,14 @@ async def deliver(bot: Bot, ref: str) -> None:
             error=None,
 
         )
+        if not completed:
+            log.error("Yetkazildi, lekin completed holati saqlanmadi: %s", ref)
+            await admins(bot, f"🚨 Yetkazildi, DB holatini qo'lda tekshiring: <code>{esc(ref)}</code>")
+            return
+
+        # Kanalga faqat Fragment muvaffaqiyatni tasdiqlagach yuboramiz.
+        # Kanal xatosi mijozga yetkazilgan mahsulot holatini o'zgartirmaydi.
+        await publish_order_to_channel(bot, ref)
 
         paid_amount = o["pay_amount"] or o["amount_uzs"]
 
@@ -3337,6 +3472,7 @@ async def main() -> None:
 
 
     sweeper_task = asyncio.create_task(order_sweeper(bot))
+    order_channel_task = asyncio.create_task(order_channel_worker(bot))
 
     # CardXabar userbotida muammo bo‘lsa ham asosiy StarsOson bot yiqilmasin.
     try:
@@ -3359,6 +3495,7 @@ async def main() -> None:
     finally:
 
         sweeper_task.cancel()
+        order_channel_task.cancel()
 
         try:
 
@@ -3366,6 +3503,11 @@ async def main() -> None:
 
         except asyncio.CancelledError:
 
+            pass
+
+        try:
+            await order_channel_task
+        except asyncio.CancelledError:
             pass
 
         if userbot is not None:
